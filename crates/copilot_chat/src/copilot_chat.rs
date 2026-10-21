@@ -538,6 +538,7 @@ pub struct CopilotChat {
     models: Option<Vec<Model>>,
     client: Arc<dyn HttpClient>,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    load_task: Option<Task<Result<()>>>,
     sign_in_task: Option<Task<()>>,
 }
 
@@ -563,11 +564,14 @@ async fn load_stored_token(
     configuration: &CopilotChatConfiguration,
     cx: &AsyncApp,
 ) -> Option<String> {
-    let (_, token) = credentials_provider
-        .read_credentials(&configuration.credentials_url(), cx)
-        .await
-        .ok()
-        .flatten()?;
+    let (_, token) = language_model::read_credentials(
+        credentials_provider.as_ref(),
+        &configuration.credentials_url(),
+        cx,
+    )
+    .await
+    .ok()
+    .flatten()?;
     String::from_utf8(token).ok()
 }
 
@@ -587,7 +591,7 @@ impl CopilotChat {
 
         // Load a previously-stored token (or the one from the environment) and
         // fetch models if we end up authenticated.
-        cx.spawn(async move |this, cx| {
+        let load_task = cx.spawn(async move |this, cx| {
             let (env_token, credentials_provider, configuration) =
                 this.read_with(cx, |this, _| {
                     (
@@ -620,8 +624,7 @@ impl CopilotChat {
                 Self::update_models(&this, cx).await?;
             }
             anyhow::Ok(())
-        })
-        .detach();
+        });
 
         Self {
             status: CopilotChatStatus::Starting,
@@ -631,6 +634,7 @@ impl CopilotChat {
             configuration,
             client,
             credentials_provider,
+            load_task: Some(load_task),
             sign_in_task: None,
         }
     }
@@ -649,6 +653,7 @@ impl CopilotChat {
             return;
         }
 
+        self.load_task = None;
         let client = self.client.clone();
         let configuration = self.configuration.clone();
         let credentials_url = configuration.credentials_url();
@@ -711,6 +716,7 @@ impl CopilotChat {
         self.oauth_token = None;
         self.api_endpoint = None;
         self.models = None;
+        self.load_task = None;
         self.sign_in_task = None;
         self.status = CopilotChatStatus::SignedOut;
         cx.notify();
@@ -901,7 +907,7 @@ impl CopilotChat {
 
             let credentials_provider = self.credentials_provider.clone();
             let configuration = self.configuration.clone();
-            cx.spawn(async move |this, cx| {
+            self.load_task = Some(cx.spawn(async move |this, cx| {
                 let token = load_stored_token(&credentials_provider, &configuration, cx).await;
                 let configuration_is_current = this.update(cx, |this, cx| {
                     if this.configuration != configuration {
@@ -926,8 +932,7 @@ impl CopilotChat {
                     }
                 }
                 Ok::<_, anyhow::Error>(())
-            })
-            .detach_and_log_err(cx);
+            }));
         }
     }
 }
@@ -1228,6 +1233,11 @@ async fn stream_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{FutureExt as _, channel::oneshot, future::LocalBoxFuture};
+    use gpui::TestAppContext;
+    use http_client::FakeHttpClient;
+    use settings::SettingsStore;
+    use std::{sync::Mutex, time::Duration};
 
     #[test]
     fn test_github_urls() {
@@ -1927,5 +1937,299 @@ mod tests {
             serde_json::to_string(&ToolChoice::None).unwrap(),
             "\"none\""
         );
+    }
+
+    #[gpui::test]
+    fn test_credential_load_configuration_changes(cx: &mut TestAppContext) {
+        let enterprise = CopilotChatConfiguration {
+            enterprise_uri: Some("https://enterprise.example".to_string()),
+        };
+        for drop_chat in [false, true] {
+            let (chat, server) = test_chat(true, cx);
+            cx.run_until_parked();
+            for configuration in [enterprise.clone(), CopilotChatConfiguration::default()] {
+                chat.update(cx, |chat, cx| chat.set_configuration(configuration, cx));
+                cx.run_until_parked();
+            }
+            assert_eq!(*server.reads.lock().expect("reads"), Vec::<String>::new());
+            assert_eq!(
+                *server.requests.lock().expect("requests"),
+                Vec::<String>::new()
+            );
+            if drop_chat {
+                drop(chat);
+                cx.run_until_parked();
+                set_disabled_ai(false, cx);
+                cx.run_until_parked();
+                assert_eq!(*server.reads.lock().expect("reads"), Vec::<String>::new());
+                assert_eq!(
+                    *server.requests.lock().expect("requests"),
+                    Vec::<String>::new()
+                );
+                continue;
+            }
+
+            set_disabled_ai(false, cx);
+            cx.run_until_parked();
+            assert_eq!(
+                *server.reads.lock().expect("reads"),
+                ["https://github.com/copilot-agent"]
+            );
+            assert_chat_auth(&chat, Some("stored-token"), cx);
+
+            let (release_discovery, pending_discovery) = oneshot::channel();
+            *server.pending_discovery.lock().expect("pending discovery") = Some(pending_discovery);
+            chat.update(cx, |chat, cx| {
+                chat.set_configuration(enterprise.clone(), cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(server.requests.lock().expect("requests").len(), 3);
+            chat.read_with(cx, |chat, _| {
+                assert_eq!(chat.api_endpoint, None);
+                assert_eq!(chat.models(), None);
+            });
+
+            *server.token.lock().expect("token") = Some("current-token".to_string());
+            chat.update(cx, |chat, cx| {
+                chat.set_configuration(CopilotChatConfiguration::default(), cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(release_discovery.send(()), Err(()));
+            cx.run_until_parked();
+            assert_chat_auth(&chat, Some("current-token"), cx);
+            assert_eq!(
+                *server.reads.lock().expect("reads"),
+                [
+                    "https://github.com/copilot-agent",
+                    "https://enterprise.example/copilot-agent",
+                    "https://github.com/copilot-agent",
+                ]
+            );
+            assert_eq!(
+                *server.requests.lock().expect("requests"),
+                [
+                    "https://api.github.com/graphql Bearer stored-token",
+                    "https://api.githubcopilot.com/models Bearer stored-token",
+                    "https://api.enterprise.example/graphql Bearer stored-token",
+                    "https://api.github.com/graphql Bearer current-token",
+                    "https://api.githubcopilot.com/models Bearer current-token",
+                ]
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_credential_load_cancelled_by_auth(cx: &mut TestAppContext) {
+        for initially_disabled in [false, true] {
+            for sign_in in [true, false] {
+                let (chat, server) = test_chat(initially_disabled, cx);
+                let release = (!initially_disabled).then(|| {
+                    let (sender, receiver) = oneshot::channel();
+                    *server.pending_read.lock().expect("pending read") = Some(receiver);
+                    sender
+                });
+                cx.run_until_parked();
+                if sign_in {
+                    chat.update(cx, |chat, cx| chat.sign_in(cx));
+                    cx.run_until_parked();
+                    cx.executor().advance_clock(Duration::from_secs(1));
+                    cx.run_until_parked();
+                } else {
+                    chat.update(cx, |chat, cx| chat.sign_out(cx))
+                        .await
+                        .expect("sign out");
+                }
+                let cancelled = release.map(|release| release.send(()));
+                set_disabled_ai(false, cx);
+                cx.run_until_parked();
+                assert_chat_auth(&chat, sign_in.then_some("signed-in-token"), cx);
+                if let Some(cancelled) = cancelled {
+                    assert_eq!(cancelled, Err(()));
+                }
+                let expected_reads = if initially_disabled {
+                    Vec::new()
+                } else {
+                    vec!["https://github.com/copilot-agent"]
+                };
+                assert_eq!(*server.reads.lock().expect("reads"), expected_reads);
+            }
+        }
+    }
+
+    fn assert_chat_auth(chat: &Entity<CopilotChat>, token: Option<&str>, cx: &TestAppContext) {
+        chat.read_with(cx, |chat, _| {
+            assert!(matches!(
+                (chat.status(), token),
+                (CopilotChatStatus::Authorized, Some(_)) | (CopilotChatStatus::SignedOut, None)
+            ));
+            assert_eq!(chat.is_authenticated(), token.is_some());
+            assert_eq!(chat.oauth_token.as_deref(), token);
+            assert_eq!(
+                chat.api_endpoint.as_deref(),
+                token.map(|_| "https://api.githubcopilot.com")
+            );
+            assert_eq!(
+                chat.models()
+                    .map(|models| models.iter().map(Model::id).collect::<Vec<_>>()),
+                token.map(|_| vec!["github-model"])
+            );
+        });
+    }
+
+    fn test_chat(
+        disabled: bool,
+        cx: &mut TestAppContext,
+    ) -> (Entity<CopilotChat>, Arc<TestCopilot>) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        set_disabled_ai(disabled, cx);
+        let server = Arc::new(TestCopilot {
+            token: Mutex::new(Some("stored-token".to_string())),
+            ..TestCopilot::default()
+        });
+        let client = FakeHttpClient::create({
+            let server = server.clone();
+            move |request| {
+                let server = server.clone();
+                async move {
+                    let authorization = request
+                        .headers()
+                        .get("Authorization")
+                        .map_or("", |value| value.to_str().expect("authorization"));
+                    server
+                        .requests
+                        .lock()
+                        .expect("requests")
+                        .push(format!("{} {authorization}", request.uri()));
+                    let body = match request.uri().path() {
+                        "/login/device/code" => serde_json::json!({
+                            "device_code": "device-code",
+                            "user_code": "user-code",
+                            "verification_uri": "https://github.com/login/device",
+                            "interval": 1,
+                        }),
+                        "/login/oauth/access_token" => serde_json::json!({
+                            "access_token": "signed-in-token",
+                        }),
+                        "/graphql" => {
+                            let pending_discovery = server
+                                .pending_discovery
+                                .lock()
+                                .expect("pending discovery")
+                                .take();
+                            if let Some(pending_discovery) = pending_discovery {
+                                pending_discovery.await?;
+                            }
+                            let endpoint = match request.uri().host() {
+                                Some("api.github.com") => "https://api.githubcopilot.com",
+                                Some("api.enterprise.example") => {
+                                    "https://copilot.enterprise.example"
+                                }
+                                _ => anyhow::bail!("unexpected discovery: {}", request.uri()),
+                            };
+                            serde_json::json!({
+                                "data": { "viewer": { "copilotEndpoints": { "api": endpoint } } },
+                            })
+                        }
+                        "/models" => {
+                            let model = match request.uri().host() {
+                                Some("api.githubcopilot.com") => "github-model",
+                                Some("copilot.enterprise.example") => "enterprise-model",
+                                _ => anyhow::bail!("unexpected model request: {}", request.uri()),
+                            };
+                            serde_json::json!({ "data": [{
+                            "billing": { "is_premium": false, "multiplier": 0 },
+                            "capabilities": { "family": model, "supports": {}, "type": "chat" },
+                            "id": model,
+                            "name": model,
+                            "vendor": "OpenAI",
+                            "is_chat_default": true,
+                            "is_chat_fallback": false,
+                            "model_picker_enabled": true,
+                        }] })
+                        }
+                        _ => anyhow::bail!("unexpected request: {}", request.uri()),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(body.to_string()))?)
+                }
+            }
+        });
+        let chat = cx.new(|cx| {
+            let mut chat = CopilotChat::new(
+                client,
+                server.clone(),
+                CopilotChatConfiguration::default(),
+                cx,
+            );
+            chat.oauth_token = None;
+            chat
+        });
+        (chat, server)
+    }
+
+    fn set_disabled_ai(disabled: bool, cx: &mut TestAppContext) {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.disable_ai = Some(disabled.into());
+            });
+        });
+    }
+
+    #[derive(Default)]
+    struct TestCopilot {
+        reads: Mutex<Vec<String>>,
+        token: Mutex<Option<String>>,
+        pending_read: Mutex<Option<oneshot::Receiver<()>>>,
+        requests: Mutex<Vec<String>>,
+        pending_discovery: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl CredentialsProvider for TestCopilot {
+        fn read_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<Option<(String, Vec<u8>)>>> {
+            self.reads.lock().expect("reads").push(url.to_string());
+            let token = self.token.lock().expect("token").clone();
+            let pending_read = self.pending_read.lock().expect("pending read").take();
+            async move {
+                if let Some(pending_read) = pending_read {
+                    pending_read.await?;
+                }
+                Ok(token.map(|token| ("Bearer".to_string(), token.into_bytes())))
+            }
+            .boxed_local()
+        }
+
+        fn write_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _username: &'a str,
+            password: &'a [u8],
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<()>> {
+            async move {
+                *self.token.lock().expect("token") = Some(String::from_utf8(password.to_vec())?);
+                Ok(())
+            }
+            .boxed_local()
+        }
+
+        fn delete_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<()>> {
+            async move {
+                *self.token.lock().expect("token") = None;
+                Ok(())
+            }
+            .boxed_local()
+        }
     }
 }

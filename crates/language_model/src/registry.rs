@@ -1,9 +1,10 @@
 use crate::{
-    LanguageModel, LanguageModelCompletionError, LanguageModelId, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderState, ZED_CLOUD_PROVIDER_ID, unavailable_error,
+    AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelId,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderState,
+    ZED_CLOUD_PROVIDER_ID, unavailable_error,
 };
 use collections::{BTreeMap, HashSet};
-use gpui::{App, Context, Entity, EventEmitter, Global, prelude::*};
+use gpui::{App, Context, Entity, EventEmitter, Global, Task, prelude::*};
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 
@@ -55,6 +56,7 @@ pub struct LanguageModelRegistry {
     thread_summary_model: Option<LanguageModel>,
     compaction_model: Option<LanguageModel>,
     providers: BTreeMap<LanguageModelProviderId, Arc<dyn LanguageModelProvider>>,
+    provider_tasks: BTreeMap<LanguageModelProviderId, ProviderTasks>,
     inline_alternatives: Vec<LanguageModel>,
     /// Set of installed extension IDs that provide language models.
     /// Used to determine which built-in providers should be hidden.
@@ -164,14 +166,31 @@ impl LanguageModelRegistry {
             subscription.detach();
         }
 
+        let provider: Arc<dyn LanguageModelProvider> = provider;
+        if self
+            .providers
+            .get(&id)
+            .is_none_or(|registered| !Arc::ptr_eq(registered, &provider))
+        {
+            self.provider_tasks.remove(&id);
+        }
         self.providers.insert(id.clone(), provider);
         cx.emit(Event::AddedProvider(id));
     }
 
     pub fn unregister_provider(&mut self, id: LanguageModelProviderId, cx: &mut Context<Self>) {
         if self.providers.remove(&id).is_some() {
+            self.provider_tasks.remove(&id);
             cx.emit(Event::RemovedProvider(id));
         }
+    }
+
+    pub fn authenticate_providers(&mut self, cx: &mut Context<Self>) {
+        self.authenticate_providers_with_retry(false, cx);
+    }
+
+    pub fn retry_authentication(&mut self, cx: &mut Context<Self>) {
+        self.authenticate_providers_with_retry(true, cx);
     }
 
     pub fn providers(&self) -> Vec<Arc<dyn LanguageModelProvider>> {
@@ -522,12 +541,98 @@ impl LanguageModelRegistry {
     pub fn inline_alternative_models(&self) -> &[LanguageModel] {
         &self.inline_alternatives
     }
+
+    fn authenticate_providers_with_retry(&mut self, retry: bool, cx: &mut Context<Self>) {
+        for provider in self.visible_providers() {
+            if retry && provider.is_authenticated(cx) {
+                continue;
+            }
+            let provider_id = provider.id();
+            let tasks = self.provider_tasks.entry(provider_id.clone()).or_default();
+            for (task, operation) in [
+                (
+                    &mut tasks.authentication,
+                    if retry {
+                        ProviderOperation::Authenticate
+                    } else {
+                        ProviderOperation::Initialize
+                    },
+                ),
+                (&mut tasks.refresh, ProviderOperation::Refresh),
+            ] {
+                if task.as_ref().is_some_and(|task| !task.is_ready())
+                    || (operation == ProviderOperation::Initialize && task.is_some())
+                    || (operation == ProviderOperation::Refresh && retry)
+                {
+                    continue;
+                }
+                *task =
+                    Some(cx.spawn({
+                        let provider = provider.clone();
+                        let provider_id = provider_id.clone();
+                        async move |registry, cx| {
+                            let result = cx
+                                .update(|cx| match operation {
+                                    ProviderOperation::Initialize => provider.initialize(cx),
+                                    ProviderOperation::Authenticate => provider.authenticate(cx),
+                                    ProviderOperation::Refresh => provider.refresh_models(cx),
+                                })
+                                .await;
+                            if let Err(err) = result {
+                                match err {
+                                    AuthenticateError::CredentialsNotFound
+                                    | AuthenticateError::ConnectionRefused => {}
+                                    _ if matches!(
+                                        provider_id.0.as_ref(),
+                                        "lmstudio" | "ollama" | "copilot_chat"
+                                    ) => {}
+                                    _ => log::error!(
+                                        "Failed to authenticate provider: {}: {err:#}",
+                                        provider.name().0
+                                    ),
+                                }
+                            }
+
+                            registry
+                                .update(cx, |registry, cx| {
+                                    if registry.providers.get(&provider_id).is_some_and(
+                                        |registered| Arc::ptr_eq(registered, &provider),
+                                    ) {
+                                        registry.refresh_fallback_model(cx);
+                                    }
+                                })
+                                .ok();
+                        }
+                    }));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProviderTasks {
+    authentication: Option<Task<()>>,
+    refresh: Option<Task<()>>,
+}
+
+#[derive(PartialEq)]
+enum ProviderOperation {
+    Initialize,
+    Authenticate,
+    Refresh,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_provider::FakeLanguageModelProvider;
+    use crate::{
+        LanguageModelClient, LanguageModelCompletionStream, LanguageModelProviderName,
+        LanguageModelRequest, ProviderSettingsView, fake_provider::FakeLanguageModelProvider,
+    };
+    use futures::{channel::oneshot, future::BoxFuture};
+    use gpui::{AsyncApp, TestAppContext, WeakEntity};
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn selected_model_allows_slashes_in_model_id() {
@@ -570,6 +675,92 @@ mod tests {
 
         let providers = registry.read(cx).providers();
         assert!(providers.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_automatic_authentication_lifetime(cx: &mut TestAppContext) {
+        let registry = cx.new(|_| LanguageModelRegistry::default());
+
+        for error in [
+            AuthenticateError::CredentialsNotFound,
+            AuthenticateError::Other(anyhow::anyhow!("keychain unavailable")),
+        ] {
+            let (provider, completion) = CountingProvider::new(&registry);
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+            });
+            for _ in 0..2 {
+                let caller = cx.new(|cx| {
+                    registry.update(cx, |registry, cx| registry.authenticate_providers(cx));
+                });
+                drop(caller);
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            cx.run_until_parked();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+                registry.authenticate_providers(cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            completion
+                .send(Err(error))
+                .expect("automatic load remains live");
+            cx.run_until_parked();
+
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+                registry.authenticate_providers(cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert!(cx.update(|cx| provider.authenticate(cx)).await.is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            registry.update(cx, |registry, cx| registry.authenticate_providers(cx));
+            cx.run_until_parked();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+            let (replacement, completion) = CountingProvider::new(&registry);
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(replacement.clone(), cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert!(completion.send(Ok(())).is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+
+            let (replacement, completion) = CountingProvider::new(&registry);
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(replacement.clone(), cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
+            registry.update(cx, |registry, cx| {
+                registry.unregister_provider(replacement.id(), cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert!(completion.send(Ok(())).is_err());
+            assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
+            registry.update(cx, |registry, cx| {
+                registry.register_provider(replacement.clone(), cx);
+                registry.authenticate_providers(cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(replacement.calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[gpui::test]
@@ -769,5 +960,91 @@ mod tests {
         });
 
         assert_eq!(registry.read(cx).visible_providers().len(), 1);
+    }
+
+    struct CountingProvider {
+        registry: WeakEntity<LanguageModelRegistry>,
+        calls: AtomicUsize,
+        response: Mutex<Option<oneshot::Receiver<Result<(), AuthenticateError>>>>,
+    }
+
+    impl CountingProvider {
+        fn new(
+            registry: &Entity<LanguageModelRegistry>,
+        ) -> (Arc<Self>, oneshot::Sender<Result<(), AuthenticateError>>) {
+            let (completion, response) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    registry: registry.downgrade(),
+                    calls: AtomicUsize::new(0),
+                    response: Mutex::new(Some(response)),
+                }),
+                completion,
+            )
+        }
+    }
+
+    impl LanguageModelProviderState for CountingProvider {
+        type ObservableEntity = ();
+
+        fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
+            None
+        }
+    }
+
+    impl LanguageModelProvider for CountingProvider {
+        fn id(&self) -> LanguageModelProviderId {
+            LanguageModelProviderId::new("counting")
+        }
+
+        fn name(&self) -> LanguageModelProviderName {
+            LanguageModelProviderName::new("Counting")
+        }
+
+        fn default_model(&self, _: &App) -> Option<LanguageModel> {
+            None
+        }
+
+        fn default_fast_model(&self, _: &App) -> Option<LanguageModel> {
+            None
+        }
+
+        fn provided_models(&self, _: &App) -> Vec<LanguageModel> {
+            Vec::new()
+        }
+
+        fn is_authenticated(&self, _: &App) -> bool {
+            false
+        }
+
+        fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+            self.registry
+                .read_with(cx, |registry, _| assert_eq!(registry.providers.len(), 1))
+                .expect("registry is readable during authentication");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let response = self.response.lock().take();
+            cx.background_spawn(async move {
+                match response {
+                    Some(response) => response.await.expect("authentication response"),
+                    None => Err(AuthenticateError::CredentialsNotFound),
+                }
+            })
+        }
+
+        fn settings_view(&self, _: &mut App) -> Option<ProviderSettingsView> {
+            None
+        }
+    }
+
+    impl LanguageModelClient for CountingProvider {
+        fn stream_completion(
+            &self,
+            _: &LanguageModel,
+            _: LanguageModelRequest,
+            _: &AsyncApp,
+        ) -> BoxFuture<'static, Result<LanguageModelCompletionStream, LanguageModelCompletionError>>
+        {
+            Box::pin(async { Err(anyhow::anyhow!("unexpected completion request").into()) })
+        }
     }
 }

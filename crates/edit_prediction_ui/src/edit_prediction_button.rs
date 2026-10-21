@@ -1,7 +1,6 @@
 use anyhow::Result;
 use client::{Client, UserStore, zed_urls};
 use cloud_llm_client::UsageLimit;
-use codestral::{self, CodestralEditPredictionDelegate};
 use copilot::Status;
 use edit_prediction::EditPredictionStore;
 use edit_prediction_types::EditPredictionDelegateHandle;
@@ -575,28 +574,25 @@ impl EditPredictionButton {
             cx.observe(&copilot, |_, _, cx| cx.notify()).detach()
         }
 
-        cx.observe_global::<SettingsStore>(move |_, cx| cx.notify())
-            .detach();
+        cx.observe_global::<SettingsStore>(move |_, cx| {
+            load_provider_credentials(cx);
+            cx.notify();
+        })
+        .detach();
 
         cx.observe_global::<EditPredictionStore>(move |_, cx| cx.notify())
             .detach();
 
         cx.observe(&user_store, |_, _, cx| cx.notify()).detach();
 
-        let mercury_api_token_task = edit_prediction::mercury::load_mercury_api_token(cx);
-        let open_ai_compatible_api_token_task =
-            edit_prediction::open_ai_compatible::load_open_ai_compatible_api_token(cx);
-
-        cx.spawn(async move |this, cx| {
-            _ = futures::join!(mercury_api_token_task, open_ai_compatible_api_token_task);
-            this.update(cx, |_, cx| {
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-
-        CodestralEditPredictionDelegate::ensure_api_key_loaded(cx);
+        load_provider_credentials(cx);
+        for key_state in [
+            edit_prediction::mercury::mercury_api_token(cx),
+            edit_prediction::open_ai_compatible::open_ai_compatible_api_token(cx),
+            codestral::codestral_api_key_state(cx),
+        ] {
+            cx.observe(&key_state, |_, _, cx| cx.notify()).detach();
+        }
 
         Self {
             editor_subscription: None,
@@ -1767,6 +1763,13 @@ fn emit_edit_prediction_menu_opened(
     );
 }
 
+fn load_provider_credentials(cx: &mut App) {
+    let _mercury_task = edit_prediction::mercury::load_mercury_api_token(cx);
+    let _open_ai_compatible_task =
+        edit_prediction::open_ai_compatible::load_open_ai_compatible_api_token(cx);
+    let _codestral_task = codestral::load_codestral_api_key(cx);
+}
+
 fn copilot_settings_url(enterprise_uri: Option<&str>) -> Arc<str> {
     match enterprise_uri {
         Some(uri) => format!("{}{}", uri.trim_end_matches('/'), COPILOT_SETTINGS_PATH).into(),
@@ -1778,8 +1781,136 @@ fn copilot_settings_url(enterprise_uri: Option<&str>) -> Arc<str> {
 mod tests {
     use super::*;
     use anyhow::Context as _;
+    use credentials_provider::test_support::FakeCredentialsProvider;
+    use futures::{FutureExt as _, StreamExt as _, channel::oneshot};
     use gpui::TestAppContext;
+    use language_model::{ApiKeyState, EnvVar};
     use settings::RootUserSettings;
+
+    use workspace::AppState;
+    use zed_credentials_provider::ZedCredentialsProvider;
+
+    #[gpui::test]
+    async fn test_provider_credentials_respect_disable_ai_and_workspace_reload(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = cx.update(AppState::test);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let credentials = Arc::new(FakeCredentialsProvider::default());
+        credentials.state.lock().fail_mutations = true;
+        let mercury_url = "https://api.inceptionlabs.ai/v1/edit/completions";
+        credentials
+            .state
+            .lock()
+            .keys
+            .insert(mercury_url.to_string(), b"mercury-key".to_vec());
+        let mercury_response = credentials.defer_read(mercury_url);
+        let [mercury_key, open_ai_key, codestral_key] = cx.update(|cx| {
+            cx.set_global(ZedCredentialsProvider(credentials.clone()));
+            let key_states = [
+                edit_prediction::mercury::mercury_api_token(cx),
+                edit_prediction::open_ai_compatible::open_ai_compatible_api_token(cx),
+                codestral::codestral_api_key_state(cx),
+            ];
+            for key_state in &key_states {
+                key_state.update(cx, |key_state, _| {
+                    *key_state = ApiKeyState::new(
+                        key_state.url.clone(),
+                        EnvVar {
+                            name: SharedString::new_static("TEST_API_KEY"),
+                            value: None,
+                        },
+                    );
+                });
+            }
+            key_states
+        });
+        set_disabled_ai(true, cx);
+        let new_button = |cx: &mut TestAppContext| {
+            cx.new(|cx| {
+                EditPredictionButton::new(
+                    app_state.fs.clone(),
+                    app_state.user_store.clone(),
+                    PopoverMenuHandle::default(),
+                    project.clone(),
+                    cx,
+                )
+            })
+        };
+
+        let buttons = [new_button(cx), new_button(cx)];
+        cx.run_until_parked();
+        assert_eq!(credentials.take_reads(), Vec::<String>::new());
+
+        set_disabled_ai(false, cx);
+        cx.run_until_parked();
+        assert_eq!(
+            credentials.take_reads(),
+            [mercury_url, "https://codestral.mistral.ai"]
+        );
+        complete_credential_read(
+            &mercury_key,
+            mercury_url,
+            mercury_response,
+            "mercury-key",
+            &buttons,
+            cx,
+        );
+
+        drop(buttons);
+        let buttons = [new_button(cx)];
+        cx.run_until_parked();
+        assert_eq!(credentials.take_reads(), Vec::<String>::new());
+        assert_eq!(
+            cx.update(edit_prediction::mercury::mercury_api_token),
+            mercury_key
+        );
+
+        let codestral_url = "https://example.com/codestral";
+        let open_ai_url = "https://example.com/completions";
+        credentials.state.lock().keys.extend([
+            (codestral_url.to_string(), b"codestral-key".to_vec()),
+            (open_ai_url.to_string(), b"open-ai-key".to_vec()),
+        ]);
+        let codestral_response = credentials.defer_read(codestral_url);
+        let open_ai_response = credentials.defer_read(open_ai_url);
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.disable_ai = Some(true.into());
+                let edit_predictions = settings
+                    .project
+                    .all_languages
+                    .edit_predictions
+                    .get_or_insert_default();
+                edit_predictions.codestral.get_or_insert_default().api_url =
+                    Some(codestral_url.to_string());
+                let open_ai = edit_predictions
+                    .open_ai_compatible_api
+                    .get_or_insert_default();
+                open_ai.api_url = Some(open_ai_url.to_string());
+                open_ai.model = Some("test-model".to_string());
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(credentials.take_reads(), Vec::<String>::new());
+
+        set_disabled_ai(false, cx);
+        cx.run_until_parked();
+        assert_eq!(credentials.take_reads(), [codestral_url, open_ai_url]);
+        for (key_state, url, response, key) in [
+            (
+                &codestral_key,
+                codestral_url,
+                codestral_response,
+                "codestral-key",
+            ),
+            (&open_ai_key, open_ai_url, open_ai_response, "open-ai-key"),
+        ] {
+            complete_credential_read(key_state, url, response, key, &buttons, cx);
+        }
+        assert_eq!(credentials.take_reads(), Vec::<String>::new());
+    }
 
     #[test]
     fn test_disabled_globs_selection_and_replacement() -> Result<()> {
@@ -1960,5 +2091,43 @@ mod tests {
         });
 
         assert_eq!(url.as_ref(), "https://github.com/settings/copilot");
+    }
+
+    fn set_disabled_ai(disabled: bool, cx: &mut TestAppContext) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.disable_ai = Some(disabled.into());
+            });
+        });
+    }
+
+    fn complete_credential_read(
+        key_state: &Entity<ApiKeyState>,
+        url: &str,
+        response: oneshot::Sender<()>,
+        key: &str,
+        buttons: &[Entity<EditPredictionButton>],
+        cx: &mut TestAppContext,
+    ) {
+        assert!(!key_state.read_with(cx, |key_state, _| key_state.has_key()));
+        let mut notifications = buttons
+            .iter()
+            .map(|button| cx.notifications(button))
+            .collect::<Vec<_>>();
+        for notifications in &mut notifications {
+            assert_eq!(notifications.next().now_or_never(), None);
+        }
+        response.send(()).expect("pending credential read");
+        cx.run_until_parked();
+        assert_eq!(
+            key_state
+                .read_with(cx, |key_state, _| key_state.key(url))
+                .as_deref(),
+            Some(key)
+        );
+        for notifications in &mut notifications {
+            assert_eq!(notifications.next().now_or_never(), Some(Some(())));
+            assert_eq!(notifications.next().now_or_never(), None);
+        }
     }
 }

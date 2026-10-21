@@ -1,10 +1,11 @@
+use super::MODEL_DISCOVERY_TIMEOUT;
 use anyhow::{Result, anyhow};
 use collections::HashMap;
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt, channel::oneshot, future::BoxFuture};
 use futures::{Stream, TryFutureExt, stream};
-use gpui::{App, AsyncApp, Context, Entity, Task, TaskExt};
+use gpui::{App, AsyncApp, Context, Entity, FutureExt as _, Task, TaskExt};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     ApiKeyState, AuthenticateError, DisabledReason, EnvVar, IconOrSvg, InlineDescription,
@@ -62,7 +63,9 @@ pub struct State {
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
     fetched_models: Vec<ollama::Model>,
-    fetch_model_task: Option<Task<Result<()>>>,
+    credential_task: Task<()>,
+    fetch_model_task: Task<()>,
+    fetch_model_api_key: Option<Arc<str>>,
 }
 
 impl State {
@@ -71,124 +74,180 @@ impl State {
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = self.credentials_provider.clone();
+        self.credential_task = Task::ready(());
+        self.fetch_model_task = Task::ready(());
         let api_url = OllamaLanguageModelProvider::api_url(cx);
         let task = self.api_key_state.store(
-            api_url,
+            api_url.clone(),
             api_key,
-            |this| &mut this.api_key_state,
-            credentials_provider,
+            |state| &mut state.api_key_state,
+            self.credentials_provider.clone(),
             cx,
         );
-
         self.fetched_models.clear();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |state, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
+            state
+                .update(cx, |state, cx| {
+                    if OllamaLanguageModelProvider::api_url(cx) == api_url {
+                        state.authenticate(false, cx).detach();
+                        state.restart_fetch_models_task(cx);
+                    }
+                })
                 .ok();
             result
         })
     }
 
-    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        let credentials_provider = self.credentials_provider.clone();
+    fn authenticate(
+        &mut self,
+        retry_credentials: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), AuthenticateError>> {
+        let key_state: fn(&mut Self) -> &mut ApiKeyState = |state| &mut state.api_key_state;
+        let load = if retry_credentials {
+            ApiKeyState::load_if_needed
+        } else {
+            ApiKeyState::load_cached
+        };
         let api_url = OllamaLanguageModelProvider::api_url(cx);
-        let task = self.api_key_state.load_if_needed(
-            api_url,
-            |this| &mut this.api_key_state,
-            credentials_provider,
+        let load_key = load(
+            &mut self.api_key_state,
+            api_url.clone(),
+            key_state,
+            self.credentials_provider.clone(),
             cx,
         );
-
-        // Always try to fetch models - if no API key is needed (local Ollama), it will work
-        // If API key is needed and provided, it will work
-        // If API key is needed and not provided, it will fail gracefully
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
-                .ok();
-            result
+        let (mut sender, receiver) = oneshot::channel();
+        self.credential_task = cx.spawn(async move |state, cx| {
+            let authenticate = async {
+                load_key.await?;
+                let discovery = state.update(cx, |state, cx| {
+                    if retry_credentials
+                        || state.api_key_state.key(&api_url) != state.fetch_model_api_key
+                    {
+                        state.fetch_model_task = Task::ready(());
+                        state.refresh_models(cx)
+                    } else {
+                        Task::ready(Ok(()))
+                    }
+                })?;
+                Ok::<_, AuthenticateError>(discovery)
+            };
+            let result = futures::select_biased! {
+                _ = sender.cancellation().fuse() => return,
+                result = authenticate.fuse() => result,
+            };
+            sender.send(result).ok();
+        });
+        cx.background_spawn(async move {
+            match receiver.await {
+                Ok(discovery) => discovery?.await,
+                Err(_) => Ok(()),
+            }
         })
     }
 
-    fn fetch_models(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let http_client = Arc::clone(&self.http_client);
-        let settings = OllamaLanguageModelProvider::settings(cx);
-        let api_url = OllamaLanguageModelProvider::api_url(cx);
-        let api_key = self.api_key_state.key(&api_url);
-        let extra_headers = settings.custom_headers.clone();
+    fn refresh_models(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        if language_model::ai_disabled(cx) || !self.fetch_model_task.is_ready() {
+            return Task::ready(Ok(()));
+        }
+        self.fetch_model_api_key = self
+            .api_key_state
+            .key(&OllamaLanguageModelProvider::api_url(cx));
+        let (mut sender, receiver) = oneshot::channel();
+        self.fetch_model_task = cx.spawn(async move |state, cx| {
+            let result = futures::select_biased! {
+                _ = sender.cancellation().fuse() => return,
+                result = Self::fetch_models(state, cx).fuse() => result,
+            };
+            sender.send(result.map_err(AuthenticateError::Other)).ok();
+        });
+        cx.background_spawn(async move { receiver.await.unwrap_or(Ok(())) })
+    }
 
-        // As a proxy for the server being "authenticated", we'll check if its up by fetching the models
-        cx.spawn(async move |this, cx| {
-            let models = get_models(
-                http_client.as_ref(),
-                &api_url,
-                api_key.as_deref(),
-                &extra_headers,
-            )
-            .await?;
+    async fn fetch_models(state: gpui::WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
+        let (http_client, api_url, api_key, extra_headers) = state.read_with(cx, |state, cx| {
+            let api_url = OllamaLanguageModelProvider::api_url(cx);
+            let api_key = state.fetch_model_api_key.clone();
+            let extra_headers = OllamaLanguageModelProvider::settings(cx)
+                .custom_headers
+                .clone();
+            (state.http_client.clone(), api_url, api_key, extra_headers)
+        })?;
+        let executor = cx.background_executor().clone();
+        let models = get_models(
+            http_client.as_ref(),
+            &api_url,
+            api_key.as_deref(),
+            &extra_headers,
+        )
+        .with_timeout(MODEL_DISCOVERY_TIMEOUT, &executor)
+        .await??;
 
-            let tasks = models
-                .into_iter()
-                // Since there is no metadata from the Ollama API
-                // indicating which models are embedding models,
-                // simply filter out models with "-embed" in their name
-                .filter(|model| !model.name.contains("-embed"))
-                .map(|model| {
-                    let http_client = Arc::clone(&http_client);
-                    let api_url = api_url.clone();
-                    let api_key = api_key.clone();
-                    let extra_headers = extra_headers.clone();
-                    async move {
-                        let name = model.name.as_str();
+        let tasks = models
+            .into_iter()
+            // Since there is no metadata from the Ollama API
+            // indicating which models are embedding models,
+            // simply filter out models with "-embed" in their name
+            .filter(|model| !model.name.contains("-embed"))
+            .map(|model| {
+                let http_client = Arc::clone(&http_client);
+                let api_url = api_url.clone();
+                let api_key = api_key.clone();
+                let extra_headers = extra_headers.clone();
+                let executor = executor.clone();
+                async move {
+                    let name = model.name.as_str();
 
-                        show_model(
-                            http_client.as_ref(),
-                            &api_url,
-                            api_key.as_deref(),
-                            name,
-                            &extra_headers,
-                        )
-                        .await
-                        .map_or_else(
-                            |error| {
-                                ollama::Model::new_disabled(
-                                    name,
-                                    format!("Failed to fetch model from API: {error}",),
-                                )
-                            },
-                            |model| {
-                                ollama::Model::new(
-                                    name,
-                                    model.context_length,
-                                    Some(model.supports_tools()),
-                                    Some(model.supports_vision()),
-                                    Some(model.supports_thinking()),
-                                )
-                            },
-                        )
-                    }
-                });
+                    show_model(
+                        http_client.as_ref(),
+                        &api_url,
+                        api_key.as_deref(),
+                        name,
+                        &extra_headers,
+                    )
+                    .with_timeout(MODEL_DISCOVERY_TIMEOUT, &executor)
+                    .await
+                    .unwrap_or_else(|error| Err(anyhow::Error::from(error)))
+                    .map_or_else(
+                        |error| {
+                            ollama::Model::new_disabled(
+                                name,
+                                format!("Failed to fetch model from API: {error}",),
+                            )
+                        },
+                        |model| {
+                            ollama::Model::new(
+                                name,
+                                model.context_length,
+                                Some(model.supports_tools()),
+                                Some(model.supports_vision()),
+                                Some(model.supports_thinking()),
+                            )
+                        },
+                    )
+                }
+            });
 
-            // Rate-limit capability fetches
-            // since there is an arbitrary number of models available
-            let mut ollama_models: Vec<_> = futures::stream::iter(tasks)
-                .buffer_unordered(5)
-                .collect()
-                .await;
+        // Rate-limit capability fetches
+        // since there is an arbitrary number of models available
+        let mut ollama_models: Vec<_> = futures::stream::iter(tasks)
+            .buffer_unordered(5)
+            .collect()
+            .await;
 
-            ollama_models.sort_by(|a, b| a.name.cmp(&b.name));
+        ollama_models.sort_by(|a, b| a.name.cmp(&b.name));
 
-            this.update(cx, |this, cx| {
-                this.fetched_models = ollama_models;
-                cx.notify();
-            })
+        state.update(cx, |state, cx| {
+            state.fetched_models = ollama_models;
+            cx.notify();
         })
     }
 
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
-        let task = self.fetch_models(cx);
-        self.fetch_model_task.replace(task);
+        self.fetch_model_task = Task::ready(());
+        self.refresh_models(cx).detach();
     }
 }
 
@@ -203,24 +262,22 @@ impl OllamaLanguageModelProvider {
             state: cx.new(|cx| {
                 cx.observe_global::<SettingsStore>({
                     let mut last_settings = OllamaLanguageModelProvider::settings(cx).clone();
-                    move |this: &mut State, cx| {
+                    let mut disabled = language_model::ai_disabled(cx);
+                    move |state: &mut State, cx| {
                         let current_settings = OllamaLanguageModelProvider::settings(cx);
-                        let settings_changed = current_settings != &last_settings;
-                        if settings_changed {
+                        let current_disabled = language_model::ai_disabled(cx);
+                        if current_settings != &last_settings || disabled != current_disabled {
                             let url_changed = last_settings.api_url != current_settings.api_url;
                             last_settings = current_settings.clone();
                             if url_changed {
-                                let credentials_provider = this.credentials_provider.clone();
-                                let api_url = Self::api_url(cx);
-                                this.api_key_state.handle_url_change(
-                                    api_url,
-                                    |this| &mut this.api_key_state,
-                                    credentials_provider,
-                                    cx,
-                                );
-                                this.fetched_models.clear();
-                                this.authenticate(cx).detach();
+                                state.fetched_models.clear();
+                                state.credential_task = Task::ready(());
+                                state.authenticate(false, cx).detach();
                             }
+                            if url_changed || disabled != current_disabled {
+                                state.restart_fetch_models_task(cx);
+                            }
+                            disabled = current_disabled;
                             cx.notify();
                         }
                     }
@@ -230,7 +287,10 @@ impl OllamaLanguageModelProvider {
                 State {
                     http_client,
                     fetched_models: Default::default(),
-                    fetch_model_task: None,
+                    credential_task: Task::ready(()),
+                    fetch_model_task: Task::ready(()),
+                    fetch_model_api_key: None,
+
                     api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
                     credentials_provider,
                 }
@@ -485,8 +545,18 @@ impl LanguageModelProvider for OllamaLanguageModelProvider {
         self.state.read(cx).is_authenticated()
     }
 
+    fn initialize(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state
+            .update(cx, |state, cx| state.authenticate(false, cx))
+    }
+
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        self.state
+            .update(cx, |state, cx| state.authenticate(true, cx))
+    }
+
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| state.refresh_models(cx))
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -708,7 +778,7 @@ impl ConfigurationView {
         }
 
         self.state.update(cx, |state, cx| {
-            state.restart_fetch_models_task(cx);
+            state.authenticate(true, cx).detach();
         });
     }
 
@@ -1151,8 +1221,136 @@ fn tool_into_ollama(tool: LanguageModelRequestTool) -> Result<ollama::OllamaTool
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::provider::tests::{
+        TestCredentials, defer, refresh_registry, register_provider, set_disabled_ai, test_settings,
+    };
+    use futures::channel::oneshot;
+    use gpui::TestAppContext;
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[gpui::test]
+    async fn test_registry_discovery_recovery(cx: &mut TestAppContext) {
+        assert_registry_discovery_recovery(
+            test_provider,
+            |provider, key, cx| {
+                provider
+                    .state
+                    .update(cx, |state, cx| state.set_api_key(key, cx))
+            },
+            DISCOVERY_RESPONSES,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_connect_during_discovery(cx: &mut TestAppContext) {
+        assert_connect_during_discovery(
+            test_provider,
+            |provider, cx| {
+                provider
+                    .state
+                    .update(cx, |state, cx| state.authenticate(true, cx).detach())
+            },
+            DISCOVERY_RESPONSES,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    fn test_metadata_deadlines_preserve_completed_models(cx: &mut TestAppContext) {
+        for stall_last_model in [false, true] {
+            cx.update(|cx| test_settings(false, cx));
+            let credentials = Arc::new(TestCredentials::default());
+            let metadata_requests = Arc::new(AtomicUsize::new(0));
+            let pending_metadata = Arc::new(Mutex::new(None));
+            let stalled_metadata = stall_last_model.then(|| defer(&pending_metadata));
+            let http_client = FakeHttpClient::create({
+                let executor = cx.background_executor.clone();
+                let metadata_requests = metadata_requests.clone();
+                let pending_metadata = pending_metadata.clone();
+                move |request| {
+                    let executor = executor.clone();
+                    let metadata_requests = metadata_requests.clone();
+                    let pending_metadata = pending_metadata.clone();
+                    async move {
+                        let body = match request.uri().path() {
+                            "/api/tags" => serde_json::json!({
+                                "models": (0..6).map(|index| serde_json::json!({
+                                    "name": format!("model-{index}"),
+                                    "modified_at": "",
+                                    "size": 0,
+                                    "digest": "",
+                                    "details": {
+                                        "format": "gguf",
+                                        "family": "llama",
+                                        "parameter_size": "",
+                                        "quantization_level": ""
+                                    }
+                                })).collect::<Vec<_>>()
+                            })
+                            .to_string(),
+                            "/api/show" => {
+                                let index = metadata_requests.fetch_add(1, Ordering::SeqCst);
+                                executor.timer(Duration::from_secs(8)).await;
+                                if index == 5 {
+                                    let wait = pending_metadata.lock().take();
+                                    if let Some(wait) = wait {
+                                        wait.await?;
+                                    }
+                                }
+                                DISCOVERY_RESPONSES[1].1.to_string()
+                            }
+                            path => anyhow::bail!("unexpected request: {path}"),
+                        };
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(body))?)
+                    }
+                }
+            });
+            let (provider, _registry) = cx.update(|cx| {
+                let provider = Arc::new(test_provider(http_client, credentials.clone(), cx));
+                let registry = register_provider(provider.clone(), cx);
+                (provider, registry)
+            });
+            cx.run_until_parked();
+            assert_eq!(metadata_requests.load(Ordering::SeqCst), 5);
+            cx.executor().advance_clock(Duration::from_secs(8));
+            cx.run_until_parked();
+            assert_eq!(metadata_requests.load(Ordering::SeqCst), 6);
+            cx.executor().advance_clock(Duration::from_secs(8));
+            cx.run_until_parked();
+            assert_eq!(
+                provider
+                    .state
+                    .read_with(cx, |state, _| state.fetched_models.len()),
+                if stall_last_model { 0 } else { 6 },
+            );
+            cx.executor().advance_clock(Duration::from_secs(7));
+            cx.run_until_parked();
+            if let Some(stalled_metadata) = stalled_metadata {
+                assert!(stalled_metadata.is_canceled());
+            }
+            assert_eq!(
+                provider.state.read_with(cx, |state, _| state
+                    .fetched_models
+                    .iter()
+                    .map(|model| (model.name.clone(), model.disabled.is_some()))
+                    .collect::<Vec<_>>()),
+                (0..6)
+                    .map(|index| (format!("model-{index}"), stall_last_model && index == 5))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     fn test_merge_settings_preserves_display_names_for_similar_models() {
@@ -1230,4 +1428,732 @@ mod tests {
         );
         assert_eq!(model_3b.max_tokens, 6000);
     }
+
+    pub(crate) async fn assert_connect_during_discovery<
+        P: LanguageModelProvider + LanguageModelProviderState,
+    >(
+        create_provider: impl Fn(Arc<dyn HttpClient>, Arc<dyn CredentialsProvider>, &mut App) -> P,
+        connect: impl Fn(&P, &mut App),
+        responses: &'static [(&'static str, &'static str)],
+        cx: &mut TestAppContext,
+    ) {
+        for (key, fail_read) in [(Some("stored-key"), false), (None, false), (None, true)] {
+            cx.update(|cx| test_settings(false, cx));
+            let credentials = Arc::new(TestCredentials::default());
+            *credentials.key.lock() = key.map(|key| key.as_bytes().to_vec());
+            let finish_read = defer(&credentials.pending_read);
+            let required_key = Arc::new(Mutex::new(key.map(String::from)));
+            let authorizations = Arc::new(Mutex::new(Vec::new()));
+            let pending_request = Arc::new(Mutex::new(None));
+            let finish_request = defer(&pending_request);
+            let http_client = FakeHttpClient::create({
+                let required_key = required_key.clone();
+                let authorizations = authorizations.clone();
+                let pending_request = pending_request.clone();
+                move |request| {
+                    let required_key = required_key.clone();
+                    let authorizations = authorizations.clone();
+                    let pending_request = pending_request.clone();
+                    async move {
+                        let authorization = request
+                            .headers()
+                            .get("Authorization")
+                            .map(|value| value.to_str().expect("authorization").to_string());
+                        if request.uri().path() == responses[0].0 {
+                            authorizations.lock().push(authorization.clone());
+                            let wait = pending_request.lock().take();
+                            if let Some(wait) = wait {
+                                wait.await?;
+                            }
+                        }
+                        if authorization
+                            != required_key
+                                .lock()
+                                .as_ref()
+                                .map(|key| format!("Bearer {key}"))
+                        {
+                            return Ok(Response::builder()
+                                .status(401)
+                                .body(AsyncBody::default())?);
+                        }
+                        let (_, body) = responses
+                            .iter()
+                            .find(|(path, _)| *path == request.uri().path())
+                            .expect("discovery endpoint");
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(*body))?)
+                    }
+                }
+            });
+            let (provider, registry) = cx.update(|cx| {
+                let provider = Arc::new(create_provider(http_client, credentials.clone(), cx));
+                let registry = register_provider(provider.clone(), cx);
+                (provider, registry)
+            });
+            cx.run_until_parked();
+            for _ in 0..3 {
+                cx.update(|cx| connect(provider.as_ref(), cx));
+                refresh_registry(&registry, cx);
+            }
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(*authorizations.lock(), vec![None]);
+            assert!(!finish_read.is_canceled());
+            finish_request
+                .send(())
+                .expect("anonymous discovery remains live");
+            cx.run_until_parked();
+            assert_models(
+                provider.as_ref(),
+                if key.is_some() { &[] } else { &["test-model"] },
+                cx,
+            );
+            if fail_read {
+                drop(finish_read);
+            } else {
+                finish_read.send(()).expect("credential read pending");
+            }
+            cx.run_until_parked();
+            let authorization = key.map(|key| format!("Bearer {key}"));
+            let mut expected = vec![None, authorization.clone()];
+            assert_eq!(*authorizations.lock(), expected);
+            assert_models(provider.as_ref(), &["test-model"], cx);
+
+            let finish_automatic_request = defer(&pending_request);
+            refresh_registry(&registry, cx);
+            expected.push(authorization.clone());
+            for _ in 0..3 {
+                refresh_registry(&registry, cx);
+            }
+            assert_eq!(*authorizations.lock(), expected);
+            cx.update(|cx| connect(provider.as_ref(), cx));
+            cx.run_until_parked();
+            expected.push(authorization);
+            assert!(finish_automatic_request.is_canceled());
+            assert_eq!(*authorizations.lock(), expected);
+            assert_eq!(
+                credentials.reads.load(Ordering::SeqCst),
+                1 + usize::from(key.is_none())
+            );
+            assert_models(provider.as_ref(), &["test-model"], cx);
+
+            if key.is_none() {
+                let finish_automatic_request = defer(&pending_request);
+                refresh_registry(&registry, cx);
+                expected.push(None);
+                *credentials.key.lock() = Some(b"recovered-key".to_vec());
+                *required_key.lock() = Some("recovered-key".to_string());
+                let finish_retry_read = defer(&credentials.pending_read);
+                for _ in 0..3 {
+                    cx.update(|cx| connect(provider.as_ref(), cx));
+                    cx.run_until_parked();
+                }
+                assert!(!finish_automatic_request.is_canceled());
+                assert_eq!(credentials.reads.load(Ordering::SeqCst), 3);
+                assert_eq!(*authorizations.lock(), expected);
+                finish_retry_read.send(()).expect("retry read pending");
+                cx.run_until_parked();
+                expected.push(Some("Bearer recovered-key".to_string()));
+                assert!(finish_automatic_request.is_canceled());
+                assert_eq!(*authorizations.lock(), expected);
+                assert_models(provider.as_ref(), &["test-model"], cx);
+            }
+        }
+    }
+
+    pub(crate) async fn assert_registry_discovery_recovery<
+        P: LanguageModelProvider + LanguageModelProviderState,
+    >(
+        create_provider: impl Fn(Arc<dyn HttpClient>, Arc<dyn CredentialsProvider>, &mut App) -> P,
+        set_api_key: impl Fn(&P, Option<String>, &mut App) -> Task<Result<()>>,
+        responses: &'static [(&'static str, &'static str)],
+        cx: &mut TestAppContext,
+    ) {
+        assert_pending_credentials_replacement(&create_provider, &set_api_key, responses, cx).await;
+        for (key, reinitialize_on_key) in [
+            (None, false),
+            (Some("stored-key"), false),
+            (Some("stored-key"), true),
+        ] {
+            cx.update(|cx| test_settings(false, cx));
+            let credentials = Arc::new(TestCredentials::default());
+            *credentials.key.lock() = key.map(|key| key.as_bytes().to_vec());
+            let finish_read = defer(&credentials.pending_read);
+            let pending_request = Arc::new(Mutex::new(None));
+            let finish_anonymous_request = reinitialize_on_key.then(|| defer(&pending_request));
+            let authenticated_request_started = Arc::new(AtomicBool::new(false));
+            let http_client = FakeHttpClient::create({
+                let pending_request = pending_request.clone();
+                let authenticated_request_started = authenticated_request_started.clone();
+                move |request| {
+                    let pending_request = pending_request.clone();
+                    let authenticated_request_started = authenticated_request_started.clone();
+                    async move {
+                        if let Some(authorization) = request.headers().get("Authorization") {
+                            assert_eq!(authorization, "Bearer stored-key");
+                            authenticated_request_started.store(true, Ordering::SeqCst);
+                        }
+                        if request.uri().path() == responses[0].0 {
+                            let wait = pending_request.lock().take();
+                            if let Some(wait) = wait {
+                                wait.await?;
+                            }
+                        }
+                        if request.headers().get("Authorization").is_none() {
+                            return Ok(Response::builder()
+                                .status(503)
+                                .body(AsyncBody::default())?);
+                        }
+                        let (_, body) = responses
+                            .iter()
+                            .find(|(path, _)| *path == request.uri().path())
+                            .expect("discovery endpoint");
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(*body))?)
+                    }
+                }
+            });
+            let provider =
+                Arc::new(cx.update(|cx| create_provider(http_client, credentials.clone(), cx)));
+            let initialization = cx.update(|cx| provider.initialize(cx));
+            if reinitialize_on_key {
+                cx.update(|cx| provider.refresh_models(cx).detach());
+            }
+            cx.run_until_parked();
+            assert!(pending_request.lock().is_none());
+            let finish_request = key.map(|_| defer(&pending_request));
+            let _subscription = reinitialize_on_key.then(|| {
+                cx.update(|cx| {
+                    let entity = provider.observable_entity().expect("provider state");
+                    let mut provider = Some(provider.clone());
+                    cx.observe(&entity, move |_, cx| {
+                        if let Some(provider) = provider.take() {
+                            provider.initialize(cx).detach();
+                        }
+                    })
+                })
+            });
+            finish_read
+                .send(())
+                .expect("initial credential read pending");
+            cx.run_until_parked();
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            if reinitialize_on_key {
+                assert!(initialization.is_ready());
+            } else if key.is_some() {
+                assert!(!initialization.is_ready());
+            }
+            if key.is_some() {
+                assert!(authenticated_request_started.load(Ordering::SeqCst));
+                assert!(pending_request.lock().is_none());
+            }
+            if let Some(finish_anonymous_request) = finish_anonymous_request {
+                assert!(finish_anonymous_request.send(()).is_err());
+            }
+            let registry = cx.update(|cx| register_provider(provider.clone(), cx));
+            refresh_registry(&registry, cx);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            if let Some(finish_request) = finish_request {
+                finish_request
+                    .send(())
+                    .expect("authenticated discovery survives reinitialization");
+            }
+            initialization.await.expect("cached initialization");
+            cx.run_until_parked();
+            assert_models(
+                provider.as_ref(),
+                if key.is_some() { &["test-model"] } else { &[] },
+                cx,
+            );
+            let authentication = cx.update(|cx| provider.authenticate(cx)).await;
+            if key.is_some() {
+                authentication.expect("stored credential authentication");
+            } else {
+                assert!(authentication.is_err());
+            }
+            assert_eq!(
+                credentials.reads.load(Ordering::SeqCst),
+                if key.is_some() { 1 } else { 2 }
+            );
+        }
+        {
+            cx.update(|cx| test_settings(true, cx));
+            let credentials = Arc::new(TestCredentials::default());
+            let available = Arc::new(AtomicBool::new(false));
+            let authorizations = Arc::new(Mutex::new(Vec::new()));
+            let response_model = Arc::new(Mutex::new("test-model"));
+            let pending_request = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
+            let pending_path = Arc::new(Mutex::new(responses[0].0));
+            let http_client = FakeHttpClient::create({
+                let available = available.clone();
+                let authorizations = authorizations.clone();
+                let pending_request = pending_request.clone();
+                let response_model = response_model.clone();
+                let pending_path = pending_path.clone();
+                move |request| {
+                    let available = available.clone();
+                    let authorizations = authorizations.clone();
+                    let pending_request = pending_request.clone();
+                    let response_model = *response_model.lock();
+                    let pending_path = *pending_path.lock();
+                    async move {
+                        let path = request.uri().path();
+                        if path == responses[0].0 {
+                            authorizations
+                                .lock()
+                                .push(request.headers().get("Authorization").map(|value| {
+                                    value.to_str().expect("authorization header").to_string()
+                                }));
+                        }
+                        if path == pending_path {
+                            let wait = pending_request.lock().take();
+                            if let Some(wait) = wait {
+                                wait.await?;
+                            }
+                        }
+                        if !available.load(Ordering::SeqCst) {
+                            return Ok(Response::builder()
+                                .status(503)
+                                .body(AsyncBody::from("not ready"))?);
+                        }
+                        let (_, body) = responses
+                            .iter()
+                            .find(|(expected, _)| *expected == path)
+                            .expect("unexpected discovery request");
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(body.replace("test-model", response_model)))?)
+                    }
+                }
+            });
+            let provider =
+                Arc::new(cx.update(|cx| create_provider(http_client, credentials.clone(), cx)));
+            cx.run_until_parked();
+            let initial_requests = 0;
+            assert_eq!(*authorizations.lock(), vec![None; initial_requests]);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 0);
+            available.store(false, Ordering::SeqCst);
+
+            let registry = cx.update(|cx| register_provider(provider.clone(), cx));
+            refresh_registry(&registry, cx);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(authorizations.lock().len(), initial_requests);
+
+            let finish_read = defer(&credentials.pending_read);
+            cx.update(|cx| set_disabled_ai(false, cx));
+            cx.run_until_parked();
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(*authorizations.lock(), vec![None]);
+            assert_models(provider.as_ref(), &[], cx);
+
+            available.store(true, Ordering::SeqCst);
+            let finish_request = defer(&pending_request);
+            for _ in 0..3 {
+                refresh_registry(&registry, cx);
+            }
+            assert_eq!(*authorizations.lock(), vec![None; 2]);
+            assert!(!finish_read.is_canceled());
+            finish_request
+                .send(())
+                .expect("anonymous refresh still pending");
+            cx.run_until_parked();
+            assert_models(provider.as_ref(), &["test-model"], cx);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            finish_read.send(()).expect("credential load still pending");
+            cx.run_until_parked();
+            assert_eq!(*authorizations.lock(), vec![None; 2]);
+
+            let finish_disabled_request = defer(&pending_request);
+            refresh_registry(&registry, cx);
+            cx.update(|cx| set_disabled_ai(true, cx));
+            refresh_registry(&registry, cx);
+            assert!(finish_disabled_request.send(()).is_err());
+            assert_eq!(*authorizations.lock(), vec![None; 3]);
+            cx.update(|cx| set_disabled_ai(false, cx));
+            cx.run_until_parked();
+            assert_eq!(*authorizations.lock(), vec![None; 4]);
+
+            *credentials.key.lock() = Some(b"retry-key".to_vec());
+            cx.update(|cx| provider.authenticate(cx))
+                .await
+                .expect("explicit credential retry");
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 2);
+            let mut expected_authorizations = vec![None; 4];
+            expected_authorizations.push(Some("Bearer retry-key".to_string()));
+            assert_eq!(*authorizations.lock(), expected_authorizations);
+
+            cx.update(|cx| set_disabled_ai(true, cx));
+            *credentials.key.lock() = Some(b"new-url-key".to_vec());
+            let finish_read = defer(&credentials.pending_read);
+            set_discovery_port(12345, cx);
+            cx.run_until_parked();
+            let requests_before_load = authorizations.lock().len();
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 2);
+            let finish_anonymous_request = defer(&pending_request);
+            cx.update(|cx| set_disabled_ai(false, cx));
+            registry.update(cx, |registry, cx| {
+                registry.authenticate_providers(cx);
+                registry.authenticate_providers(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 3);
+            assert_eq!(authorizations.lock().len(), requests_before_load + 1);
+            assert_eq!(authorizations.lock().last(), Some(&None));
+            finish_read
+                .send(())
+                .expect("new URL credential load pending");
+            cx.run_until_parked();
+            assert!(finish_anonymous_request.send(()).is_err());
+            assert_eq!(
+                authorizations.lock().last(),
+                Some(&Some("Bearer new-url-key".to_string()))
+            );
+            refresh_registry(&registry, cx);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 3);
+
+            for (replacement, expected_model) in [
+                (DiscoveryReplacement::Url, "new-url-model"),
+                (DiscoveryReplacement::RoundTripUrl, "returned-url-model"),
+                (DiscoveryReplacement::Key, "new-key-model"),
+                (DiscoveryReplacement::ResetKey, "reset-key-model"),
+            ] {
+                *response_model.lock() = "stale-model";
+                let finish_request = defer(&pending_request);
+                let requests_before_replacement = authorizations.lock().len();
+                refresh_registry(&registry, cx);
+                assert_eq!(authorizations.lock().len(), requests_before_replacement + 1);
+                *response_model.lock() = expected_model;
+                match replacement {
+                    DiscoveryReplacement::Url => set_discovery_port(12346, cx),
+                    DiscoveryReplacement::RoundTripUrl => {
+                        set_discovery_port(12345, cx);
+                        cx.run_until_parked();
+                        set_discovery_port(12346, cx);
+                    }
+                    DiscoveryReplacement::Key | DiscoveryReplacement::ResetKey => {
+                        let key = match replacement {
+                            DiscoveryReplacement::Key => Some("replacement-key".to_string()),
+                            _ => None,
+                        };
+                        cx.update(|cx| set_api_key(provider.as_ref(), key, cx))
+                            .await
+                            .expect("replace credentials");
+                    }
+                }
+                cx.run_until_parked();
+                assert_models(provider.as_ref(), &[expected_model], cx);
+                match replacement {
+                    DiscoveryReplacement::Key => assert_eq!(
+                        authorizations.lock().last(),
+                        Some(&Some("Bearer replacement-key".to_string())),
+                    ),
+                    DiscoveryReplacement::ResetKey => {
+                        assert_eq!(authorizations.lock().last(), Some(&None))
+                    }
+                    _ => {}
+                }
+                let cancelled = finish_request.send(()).is_err();
+                cx.run_until_parked();
+                assert_models(provider.as_ref(), &[expected_model], cx);
+                assert!(cancelled);
+            }
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 6);
+
+            for (path, _) in responses {
+                *pending_path.lock() = path;
+                let finish_request = defer(&pending_request);
+                refresh_registry(&registry, cx);
+                cx.executor().advance_clock(Duration::from_secs(14));
+                refresh_registry(&registry, cx);
+                assert!(!finish_request.is_canceled());
+                cx.executor().advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+                assert!(finish_request.is_canceled());
+                refresh_registry(&registry, cx);
+                assert_models(provider.as_ref(), &["reset-key-model"], cx);
+                assert_eq!(credentials.reads.load(Ordering::SeqCst), 6);
+            }
+            *pending_path.lock() = responses[0].0;
+
+            let finish_request = defer(&pending_request);
+            let requests_before_cancel = authorizations.lock().len();
+            refresh_registry(&registry, cx);
+            assert_eq!(authorizations.lock().len(), requests_before_cancel + 1);
+            registry.update(cx, |registry, cx| {
+                registry.unregister_provider(provider.id(), cx)
+            });
+            cx.run_until_parked();
+            assert!(finish_request.send(()).is_err());
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 6);
+        }
+    }
+
+    async fn assert_pending_credentials_replacement<
+        P: LanguageModelProvider + LanguageModelProviderState,
+    >(
+        create_provider: &impl Fn(Arc<dyn HttpClient>, Arc<dyn CredentialsProvider>, &mut App) -> P,
+        set_api_key: &impl Fn(&P, Option<String>, &mut App) -> Task<Result<()>>,
+        responses: &'static [(&'static str, &'static str)],
+        cx: &mut TestAppContext,
+    ) {
+        for (replacement, disabled, fail_store) in [
+            (DiscoveryReplacement::Url, false, false),
+            (DiscoveryReplacement::Url, true, false),
+            (DiscoveryReplacement::RoundTripUrl, false, false),
+            (DiscoveryReplacement::RoundTripUrl, true, false),
+            (DiscoveryReplacement::Key, false, false),
+            (DiscoveryReplacement::ResetKey, true, false),
+            (DiscoveryReplacement::Key, false, true),
+        ] {
+            cx.update(|cx| test_settings(false, cx));
+            set_discovery_port(12345, cx);
+            let credentials = Arc::new(TestCredentials::default());
+            *credentials.key.lock() = Some(b"key-A".to_vec());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server = Arc::new(Mutex::new((Some("key-A".to_string()), "model-A")));
+            let http_client = FakeHttpClient::create({
+                let requests = requests.clone();
+                let server = server.clone();
+                move |request| {
+                    let requests = requests.clone();
+                    let (required_key, model) = server.lock().clone();
+                    async move {
+                        let authorization = request
+                            .headers()
+                            .get("Authorization")
+                            .map(|value| value.to_str().expect("authorization").to_string());
+                        if request.uri().path() == responses[0].0 {
+                            let (finish, wait) = oneshot::channel();
+                            requests.lock().push(PendingDiscovery {
+                                port: request.uri().port_u16().expect("test server port"),
+                                authorization: authorization.clone(),
+                                finish,
+                            });
+                            wait.await?;
+                        }
+                        if authorization != required_key.map(|key| format!("Bearer {key}")) {
+                            return Ok(Response::builder()
+                                .status(401)
+                                .body(AsyncBody::default())?);
+                        }
+                        let (_, body) = responses
+                            .iter()
+                            .find(|(path, _)| *path == request.uri().path())
+                            .expect("discovery endpoint");
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(body.replace("test-model", model)))?)
+                    }
+                }
+            });
+            let mut finish_old_read = Some(defer(&credentials.pending_read));
+            let provider =
+                Arc::new(cx.update(|cx| create_provider(http_client, credentials.clone(), cx)));
+            cx.run_until_parked();
+            let registry = cx.update(|cx| register_provider(provider.clone(), cx));
+            cx.run_until_parked();
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            assert_pending_discovery_requests(&requests, &[(12345, None)]);
+            cx.update(|cx| set_disabled_ai(disabled, cx));
+            let (port, expected_key, expected_model, expected_reads) = match replacement {
+                DiscoveryReplacement::Url | DiscoveryReplacement::RoundTripUrl => {
+                    let finish_write = defer(&credentials.pending_write);
+                    let mutation = cx.update(|cx| {
+                        set_api_key(provider.as_ref(), Some("stored-key-A".to_string()), cx)
+                    });
+                    let authentication = cx.update(|cx| provider.authenticate(cx));
+                    cx.run_until_parked();
+                    assert!(!authentication.is_ready());
+                    *credentials.key.lock() = Some(b"key-B".to_vec());
+                    *server.lock() = (Some("key-B".to_string()), "model-B");
+                    let finish_read = defer(&credentials.pending_read);
+                    set_discovery_port(12346, cx);
+                    cx.run_until_parked();
+                    assert_pending_discovery_requests(
+                        &requests,
+                        if disabled { &[] } else { &[(12346, None)] },
+                    );
+                    assert_eq!(
+                        credentials.reads.load(Ordering::SeqCst),
+                        if disabled { 1 } else { 2 }
+                    );
+                    cx.update(|cx| set_disabled_ai(false, cx));
+                    cx.run_until_parked();
+                    assert_pending_discovery_requests(&requests, &[(12346, None)]);
+
+                    let (finish_read, port, key, model, reads) = match replacement {
+                        DiscoveryReplacement::RoundTripUrl => {
+                            *credentials.key.lock() = Some(b"key-A2".to_vec());
+                            *server.lock() = (Some("key-A2".to_string()), "model-A2");
+                            let finish_current_read = defer(&credentials.pending_read);
+                            set_discovery_port(12345, cx);
+                            cx.run_until_parked();
+                            assert_pending_discovery_requests(&requests, &[(12345, None)]);
+                            assert!(finish_read.send(()).is_err());
+                            (finish_current_read, 12345, "key-A2", "model-A2", 3)
+                        }
+                        _ => (finish_read, 12346, "key-B", "model-B", 2),
+                    };
+                    finish_write
+                        .send(())
+                        .expect("old URL mutation remains pending");
+                    mutation.await.expect("old URL mutation completed");
+                    assert_eq!(*credentials.key.lock(), Some(b"stored-key-A".to_vec()));
+                    authentication.await.expect("superseded credential read");
+                    finish_read
+                        .send(())
+                        .expect("current credential read pending");
+                    (port, Some(key), model, reads)
+                }
+                DiscoveryReplacement::Key if fail_store => {
+                    let finish_write = defer(&credentials.pending_write);
+                    let mutation = cx.update(|cx| {
+                        set_api_key(provider.as_ref(), Some("failed-key".to_string()), cx)
+                    });
+                    cx.run_until_parked();
+                    drop(finish_write);
+                    assert!(
+                        mutation
+                            .await
+                            .expect_err("store must fail")
+                            .is::<oneshot::Canceled>()
+                    );
+                    cx.run_until_parked();
+                    complete_discovery_requests(&requests, &[(12345, None)]);
+                    cx.run_until_parked();
+                    assert_models(provider.as_ref(), &[], cx);
+                    finish_old_read
+                        .take()
+                        .expect("initial credential read")
+                        .send(())
+                        .expect("stored credential still pending after failed write");
+                    (12345, Some("key-A"), "model-A", 1)
+                }
+                DiscoveryReplacement::Key | DiscoveryReplacement::ResetKey => {
+                    let (key, model) = match replacement {
+                        DiscoveryReplacement::Key => (Some("written-key"), "written-model"),
+                        _ => (None, "reset-model"),
+                    };
+                    *server.lock() = (key.map(String::from), model);
+                    cx.update(|cx| set_api_key(provider.as_ref(), key.map(String::from), cx))
+                        .await
+                        .expect("replace pending credentials");
+                    (12345, key, model, 1)
+                }
+            };
+            cx.update(|cx| set_disabled_ai(false, cx));
+            cx.run_until_parked();
+            let expected_authorization = expected_key.map(|key| format!("Bearer {key}"));
+            complete_discovery_requests(&requests, &[(port, expected_authorization.as_deref())]);
+            cx.run_until_parked();
+            assert_models(provider.as_ref(), &[expected_model], cx);
+            if let Some(finish_old_read) = finish_old_read {
+                assert!(finish_old_read.send(()).is_err());
+            }
+            cx.run_until_parked();
+            assert_eq!(requests.lock().len(), 0);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), expected_reads);
+            assert_models(provider.as_ref(), &[expected_model], cx);
+            registry.update(cx, |registry, cx| {
+                registry.unregister_provider(provider.id(), cx)
+            });
+        }
+    }
+
+    struct PendingDiscovery {
+        port: u16,
+        authorization: Option<String>,
+        finish: oneshot::Sender<()>,
+    }
+
+    fn complete_discovery_requests(
+        requests: &Mutex<Vec<PendingDiscovery>>,
+        expected: &[(u16, Option<&str>)],
+    ) {
+        assert_pending_discovery_requests(requests, expected);
+        for request in std::mem::take(&mut *requests.lock()) {
+            if request.finish.is_canceled() {
+                assert!(request.finish.send(()).is_err());
+            } else {
+                request.finish.send(()).expect("discovery remains pending");
+            }
+        }
+    }
+
+    fn assert_pending_discovery_requests(
+        requests: &Mutex<Vec<PendingDiscovery>>,
+        expected: &[(u16, Option<&str>)],
+    ) {
+        assert_eq!(
+            requests
+                .lock()
+                .iter()
+                .filter(|request| !request.finish.is_canceled())
+                .map(|request| (request.port, request.authorization.as_deref()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    enum DiscoveryReplacement {
+        Url,
+        RoundTripUrl,
+        Key,
+        ResetKey,
+    }
+
+    fn set_discovery_port(port: u16, cx: &mut TestAppContext) {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                let models = settings.language_models.get_or_insert_default();
+                models.ollama.get_or_insert_default().api_url =
+                    Some(format!("http://localhost:{port}"));
+                models.lmstudio.get_or_insert_default().api_url =
+                    Some(format!("http://localhost:{port}/api/v0"));
+                models.llama_cpp.get_or_insert_default().api_url =
+                    Some(format!("http://localhost:{port}"));
+            });
+        });
+    }
+
+    fn assert_models(provider: &dyn LanguageModelProvider, expected: &[&str], cx: &TestAppContext) {
+        assert_eq!(
+            cx.read(|cx| provider
+                .provided_models(cx)
+                .into_iter()
+                .map(|model| model.id.0.to_string())
+                .collect::<Vec<_>>()),
+            expected,
+        );
+    }
+
+    fn test_provider(
+        http_client: Arc<dyn HttpClient>,
+        credentials: Arc<dyn CredentialsProvider>,
+        cx: &mut App,
+    ) -> OllamaLanguageModelProvider {
+        let provider = OllamaLanguageModelProvider::new(http_client, credentials, cx);
+        provider.state.update(cx, |state, cx| {
+            state.api_key_state = ApiKeyState::new(
+                OllamaLanguageModelProvider::api_url(cx),
+                EnvVar {
+                    name: SharedString::new_static("TEST_API_KEY"),
+                    value: None,
+                },
+            );
+        });
+        provider
+    }
+
+    const DISCOVERY_RESPONSES: &[(&str, &str)] = &[
+        (
+            "/api/tags",
+            r#"{"models":[{"name":"test-model","modified_at":"","size":0,"digest":"","details":{"format":"gguf","family":"llama","parameter_size":"","quantization_level":""}}]}"#,
+        ),
+        (
+            "/api/show",
+            r#"{"capabilities":["completion"],"model_info":{"general.architecture":"llama","llama.context_length":4096}}"#,
+        ),
+    ];
 }

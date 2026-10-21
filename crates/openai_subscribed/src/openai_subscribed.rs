@@ -120,9 +120,12 @@ impl State {
             .spawn({
                 let credentials_provider = credentials_provider.clone();
                 async move |this, cx| {
-                    let result = credentials_provider
-                        .read_credentials(CREDENTIALS_KEY, cx)
-                        .await;
+                    let result = language_model::read_credentials(
+                        credentials_provider.as_ref(),
+                        CREDENTIALS_KEY,
+                        cx,
+                    )
+                    .await;
                     let refresh_models_task = this.update(cx, |state, cx| {
                         match result {
                             Ok(Some((_, bytes))) => {

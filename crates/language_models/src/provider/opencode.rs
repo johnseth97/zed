@@ -1,3 +1,4 @@
+use super::MODEL_DISCOVERY_TIMEOUT;
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::{BTreeMap, HashMap};
 use credentials_provider::CredentialsProvider;
@@ -79,7 +80,6 @@ static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 const OPENCODE_SESSION_HEADER_NAME: &str = "x-opencode-session";
 const RICH_MODEL_CATALOG_URL: &str = "https://models.opencode.ai/api.json";
 const MODEL_CATALOG_RESPONSE_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
-const MODEL_CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_CATALOG_DISK_FRESHNESS: Duration = Duration::from_secs(5 * 60);
 const MODEL_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &[OPENCODE_SESSION_HEADER_NAME];
@@ -107,6 +107,7 @@ pub struct State {
     fetch_models_errors: HashMap<OpenCodeSubscription, SharedString>,
     fetch_models_task: Option<Task<()>>,
     refresh_models_task: Option<Task<()>>,
+    is_refreshing_models: bool,
     cache_path: PathBuf,
     fs: Arc<dyn Fs>,
 }
@@ -128,6 +129,7 @@ impl State {
         let api_url = OpenCodeLanguageModelProvider::api_url(cx);
         self.fetch_models_task = None;
         self.refresh_models_task = None;
+        self.is_refreshing_models = false;
         self.discovered_models.clear();
         self.fetch_models_errors.clear();
         let task = self.api_key_state.store(
@@ -170,6 +172,7 @@ impl State {
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
         self.fetch_models_task = None;
         self.refresh_models_task = None;
+        self.is_refreshing_models = false;
         let api_url = OpenCodeLanguageModelProvider::api_url(cx);
         if self.api_key_state.key(&api_url).is_none() {
             self.fetch_models_task = None;
@@ -233,6 +236,22 @@ impl State {
         self.refresh_models_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 executor.timer(MODEL_CATALOG_REFRESH_INTERVAL).await;
+                let Ok(should_refresh) = this.update(cx, |state, _cx| {
+                    if state
+                        .fetch_models_task
+                        .as_ref()
+                        .is_some_and(|task| !task.is_ready())
+                    {
+                        return false;
+                    }
+                    state.is_refreshing_models = true;
+                    true
+                }) else {
+                    break;
+                };
+                if !should_refresh {
+                    continue;
+                }
                 let catalog = fetch_model_catalog(http_client.clone(), executor.clone()).await;
                 let results = catalog_results(catalog.as_ref().map(String::as_str));
                 if results.iter().all(|(_, result)| result.is_ok())
@@ -244,6 +263,7 @@ impl State {
                 }
                 if this
                     .update(cx, |this, cx| {
+                        this.is_refreshing_models = false;
                         apply_discovery_results(
                             &mut this.discovered_models,
                             &mut this.fetch_models_errors,
@@ -352,6 +372,7 @@ impl OpenCodeLanguageModelProvider {
                         this.fetch_models_errors.clear();
                         this.fetch_models_task = None;
                         this.refresh_models_task = None;
+                        this.is_refreshing_models = false;
                         this.authenticate(cx).detach();
                     }
                     cx.notify();
@@ -366,6 +387,7 @@ impl OpenCodeLanguageModelProvider {
                 fetch_models_errors: HashMap::default(),
                 fetch_models_task: None,
                 refresh_models_task: None,
+                is_refreshing_models: false,
                 cache_path,
                 fs,
             }
@@ -713,6 +735,18 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
         self.state.update(cx, |state, cx| state.authenticate(cx))
+    }
+
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| {
+            if state.is_authenticated()
+                && !state.is_refreshing_models
+                && state.fetch_models_task.as_ref().is_none_or(Task::is_ready)
+            {
+                state.restart_fetch_models_task(cx);
+            }
+        });
+        Task::ready(Ok(()))
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -1177,7 +1211,7 @@ async fn fetch_model_catalog(
     executor: BackgroundExecutor,
 ) -> Result<String> {
     let fetch = fetch_catalog_resource(client.as_ref(), RICH_MODEL_CATALOG_URL).fuse();
-    let timeout = executor.timer(MODEL_CATALOG_FETCH_TIMEOUT).fuse();
+    let timeout = executor.timer(MODEL_DISCOVERY_TIMEOUT).fuse();
     futures::pin_mut!(fetch, timeout);
     futures::select_biased! {
         result = fetch => result,
@@ -1444,9 +1478,51 @@ impl Render for ConfigurationView {
 mod tests {
     use super::*;
     use fs::FakeFs;
+    use futures::channel::oneshot;
     use http_client::{FakeHttpClient, Response};
     use language_model::{LanguageModelRequestMessage, MessageContent, Role};
     use parking_lot::Mutex;
+
+    #[gpui::test]
+    async fn test_registry_refreshes_catalog_without_reloading_credentials(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::provider::tests::assert_catalog_refresh(
+            cx,
+            |http_client, credentials, cx| {
+                let provider = OpenCodeLanguageModelProvider::new_with_cache(
+                    http_client,
+                    credentials,
+                    FakeFs::new(cx.background_executor().clone()),
+                    PathBuf::from("/cache/models.json"),
+                    cx,
+                );
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        OpenCodeLanguageModelProvider::api_url(cx),
+                        EnvVar {
+                            name: "TEST_API_KEY".into(),
+                            value: None,
+                        },
+                    );
+                });
+                provider
+            },
+            test_catalog(),
+            |provider, cx| {
+                provider
+                    .state
+                    .read(cx)
+                    .discovered_models
+                    .values()
+                    .flatten()
+                    .map(|model| model.model.id().to_string())
+                    .collect()
+            },
+            &["go-model", "zen-model"],
+        )
+        .await;
+    }
 
     fn test_catalog() -> &'static str {
         r#"{
@@ -1500,13 +1576,19 @@ mod tests {
             }
             let requests = Arc::new(Mutex::new(0));
             let fail_request = Arc::new(Mutex::new(fail));
+            let deferred_response = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
             let client = FakeHttpClient::create({
                 let requests = requests.clone();
                 let fail_request = fail_request.clone();
+                let deferred_response = deferred_response.clone();
                 move |_| {
                     *requests.lock() += 1;
                     let status = if *fail_request.lock() { 503 } else { 200 };
+                    let deferred_response = deferred_response.lock().take();
                     async move {
+                        if let Some(response) = deferred_response {
+                            response.await?;
+                        }
                         Ok(Response::builder().status(status).body(AsyncBody::from(
                             test_catalog().replace("zen-model", "updated-model"),
                         ))?)
@@ -1551,10 +1633,19 @@ mod tests {
             }
 
             *fail_request.lock() = false;
+            let (sender, receiver) = oneshot::channel();
+            *deferred_response.lock() = Some(receiver);
             cx.background_executor
                 .advance_clock(MODEL_CATALOG_REFRESH_INTERVAL);
             cx.run_until_parked();
             assert_eq!(*requests.lock(), initial_requests + 1);
+            for _ in 0..3 {
+                cx.update(|cx| provider.refresh_models(cx)).await.unwrap();
+                cx.run_until_parked();
+            }
+            assert_eq!(*requests.lock(), initial_requests + 1);
+            sender.send(()).expect("periodic request was not cancelled");
+            cx.run_until_parked();
             provider.state.read_with(cx, |state, _cx| {
                 assert_eq!(
                     state.discovered_models[&OpenCodeSubscription::Zen][0]

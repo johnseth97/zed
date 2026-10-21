@@ -1,3 +1,6 @@
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -9,6 +12,10 @@ use gpui::AsyncApp;
 /// Used to abstract over reading and writing credentials to some form of
 /// persistence (like the system keychain).
 pub trait CredentialsProvider: Send + Sync {
+    fn supports_read_cancellation(&self) -> bool {
+        false
+    }
+
     /// Reads the credentials from the provider.
     fn read_credentials<'a>(
         &'a self,

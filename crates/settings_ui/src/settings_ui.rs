@@ -18,7 +18,7 @@ use gpui::{
 
 use language::Buffer;
 use platform_title_bar::PlatformTitleBar;
-use project::{Project, ProjectPath, Worktree, WorktreeId};
+use project::{DisableAiSettings, Project, ProjectPath, Worktree, WorktreeId};
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -4349,6 +4349,7 @@ impl SettingsWindow {
         self.sandbox_host_validation_error = None;
         self.sub_page_stack
             .push(SubPage::new(sub_page_link, section_header));
+        self.retry_llm_provider_authentication(cx);
         self.content_focus_handle.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -4559,8 +4560,20 @@ impl SettingsWindow {
         {
             self.skill_creator_page = None;
         }
+        self.retry_llm_provider_authentication(cx);
         self.content_focus_handle.focus_handle(cx).focus(window, cx);
         cx.notify();
+    }
+
+    fn retry_llm_provider_authentication(&self, cx: &mut Context<Self>) {
+        if self.sub_page_stack.last().is_some_and(|sub_page| {
+            sub_page.link.json_path == Some("llm_providers")
+                && sub_page.link.title.as_ref() == "LLM Providers"
+        }) && !DisableAiSettings::get_global(cx).disable_ai
+        {
+            language_model::LanguageModelRegistry::global(cx)
+                .update(cx, |registry, cx| registry.retry_authentication(cx));
+        }
     }
 
     pub(crate) fn active_project(&self, cx: &App) -> Option<Entity<Project>> {
@@ -5427,6 +5440,12 @@ fn render_icon_theme_picker(
 pub mod test {
 
     use super::*;
+    use credentials_provider::test_support::FakeCredentialsProvider;
+    use language_model::{
+        ApiKeyState, EnvVar, LanguageModelProvider, LanguageModelProviderState,
+        LanguageModelRegistry,
+    };
+    use language_models::provider::open_ai_compatible::OpenAiCompatibleLanguageModelProvider;
 
     impl SettingsWindow {
         fn navbar_entry(&self) -> usize {
@@ -7286,6 +7305,188 @@ pub mod test {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn test_llm_provider_settings_retry_credentials(cx: &mut gpui::TestAppContext) {
+        let app_state = cx.update(|cx| {
+            register_settings(cx);
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .language_models
+                        .get_or_insert_default()
+                        .openai_compatible
+                        .get_or_insert_default()
+                        .insert(
+                            Arc::from("settings-retry"),
+                            settings::OpenAiCompatibleSettingsContent {
+                                api_url: SETTINGS_CREDENTIALS_URL.to_string(),
+                                available_models: Vec::new(),
+                                custom_headers: None,
+                            },
+                        );
+                });
+            });
+            app_state
+        });
+        let (settings_window, cx) =
+            cx.add_window_view(|window, cx| SettingsWindow::new(None, window, cx));
+        cx.run_until_parked();
+
+        for fail_reads in [true, false] {
+            let credentials = Arc::new(FakeCredentialsProvider::default());
+            {
+                let mut state = credentials.state.lock();
+                state.fail_reads = fail_reads;
+                state.fail_mutations = true;
+            }
+            let (provider, provider_state, registry) = cx.update(|_, cx| {
+                let provider = Arc::new(OpenAiCompatibleLanguageModelProvider::new(
+                    Arc::from("settings-retry"),
+                    app_state.client.http_client(),
+                    credentials.clone(),
+                    cx,
+                ));
+                let provider_state = provider.observable_entity().expect("provider state");
+                provider_state.update(cx, |state, _| {
+                    state.api_key_state = ApiKeyState::new(
+                        SharedString::from(SETTINGS_CREDENTIALS_URL),
+                        EnvVar {
+                            name: SharedString::from("TEST_SETTINGS_API_KEY"),
+                            value: None,
+                        },
+                    );
+                });
+                let registry = LanguageModelRegistry::global(cx);
+                registry.update(cx, |registry, cx| {
+                    registry.register_provider(provider.clone(), cx);
+                    registry.authenticate_providers(cx);
+                });
+                (provider, provider_state, registry)
+            });
+            cx.run_until_parked();
+            credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL]);
+            assert!(!cx.read(|cx| provider.is_authenticated(cx)));
+
+            cx.cx
+                .update(|cx| open_settings_editor(Some("llm_providers"), None, None, cx));
+            cx.run_until_parked();
+            settings_window.read_with(cx, |settings_window, _| {
+                assert_eq!(
+                    settings_window
+                        .sub_page_stack
+                        .last()
+                        .map(|page| page.link.title.as_ref()),
+                    Some("LLM Providers")
+                );
+            });
+            credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 2]);
+
+            for _ in 0..3 {
+                registry.update(cx, |registry, cx| registry.authenticate_providers(cx));
+                cx.update(|_, cx| {
+                    cx.update_global::<SettingsStore, _>(|store, cx| {
+                        store.update_user_settings(cx, |settings| {
+                            settings.project.disable_ai = if settings.project.disable_ai.is_some() {
+                                None
+                            } else {
+                                Some(false.into())
+                            };
+                        });
+                    });
+                    assert!(!DisableAiSettings::get_global(cx).disable_ai);
+                });
+                settings_window.update(cx, |_, cx| cx.notify());
+                cx.draw(
+                    point(px(0.), px(0.)),
+                    gpui::size(px(1000.), px(700.)),
+                    |_, _| settings_window.clone().into_any_element(),
+                );
+                cx.run_until_parked();
+                credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 2]);
+            }
+
+            {
+                let mut state = credentials.state.lock();
+                state.fail_reads = false;
+                state.keys.insert(
+                    SETTINGS_CREDENTIALS_URL.to_string(),
+                    b"restored-key".to_vec(),
+                );
+            }
+            cx.update(|_, cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.project.disable_ai = Some(true.into());
+                    });
+                });
+            });
+            settings_window.update_in(cx, |settings_window, window, cx| {
+                settings_window.pop_sub_page(window, cx);
+            });
+            cx.cx
+                .update(|cx| open_settings_editor(Some("llm_providers"), None, None, cx));
+            cx.run_until_parked();
+            credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 2]);
+            assert!(!cx.read(|cx| provider.is_authenticated(cx)));
+
+            cx.update(|_, cx| {
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.project.disable_ai = Some(false.into());
+                    });
+                });
+            });
+            cx.run_until_parked();
+            credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 2]);
+
+            let release = credentials.defer_read(SETTINGS_CREDENTIALS_URL);
+            registry.update(cx, |registry, cx| registry.authenticate_providers(cx));
+            cx.cx
+                .update(|cx| open_settings_editor(Some("llm_providers"), None, None, cx));
+            cx.run_until_parked();
+            credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 3]);
+            for disable_ai in [false, true, false] {
+                cx.cx.update(|cx| {
+                    cx.update_global::<SettingsStore, _>(|store, cx| {
+                        store.update_user_settings(cx, |settings| {
+                            settings.project.disable_ai = Some(disable_ai.into());
+                        });
+                    });
+                });
+                settings_window.update_in(cx, |settings_window, window, cx| {
+                    settings_window.pop_sub_page(window, cx);
+                });
+                cx.cx
+                    .update(|cx| open_settings_editor(Some("llm_providers"), None, None, cx));
+                cx.run_until_parked();
+                credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 3]);
+                assert!(!cx.read(|cx| provider.is_authenticated(cx)));
+            }
+
+            release.send(()).expect("pending credential read");
+            cx.run_until_parked();
+            assert!(cx.read(|cx| provider.is_authenticated(cx)));
+            assert_eq!(
+                provider_state
+                    .read_with(cx, |state, _| {
+                        state.api_key_state.key(SETTINGS_CREDENTIALS_URL)
+                    })
+                    .as_deref(),
+                Some("restored-key")
+            );
+            cx.cx
+                .update(|cx| open_settings_editor(Some("llm_providers"), None, None, cx));
+            registry.update(cx, |registry, cx| registry.authenticate_providers(cx));
+            cx.run_until_parked();
+            credentials.assert_reads(&[SETTINGS_CREDENTIALS_URL; 3]);
+            registry.update(cx, |registry, cx| {
+                registry.unregister_provider(provider.id(), cx)
+            });
+        }
+    }
+
     fn settings_window_with_items(
         items: Vec<SettingsPageItem>,
         window: &mut Window,
@@ -7325,6 +7526,8 @@ pub mod test {
             |_, _| view.clone().into_any_element(),
         );
     }
+
+    const SETTINGS_CREDENTIALS_URL: &str = "https://settings-provider.example/v1";
 
     struct TestSettingsPage(Entity<SettingsWindow>);
 

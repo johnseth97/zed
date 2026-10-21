@@ -69,6 +69,10 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
 struct KeychainCredentialsProvider;
 
 impl CredentialsProvider for KeychainCredentialsProvider {
+    fn supports_read_cancellation(&self) -> bool {
+        cfg!(any(target_os = "linux", target_os = "freebsd"))
+    }
+
     fn read_credentials<'a>(
         &'a self,
         url: &'a str,
